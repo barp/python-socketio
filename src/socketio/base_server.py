@@ -353,7 +353,7 @@ class BaseServer:
             return None
 
         recovery = self._recovery_sessions[pid][namespace]
-        
+
         # Check if session has expired
         cfg = self.connection_state_recovery
         max_duration = cfg['max_disconnection_duration']

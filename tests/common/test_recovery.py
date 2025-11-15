@@ -254,7 +254,6 @@ class TestRecovery:
         s._handle_eio_connect('eio123', {})
         connect_pkt = packet.Packet(packet.CONNECT, namespace='/', data={})
         s._handle_eio_message('eio123', connect_pkt.encode())
-        sid = '1'
         eio_sid = 'eio123'
 
         # Send an event

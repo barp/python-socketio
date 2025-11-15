@@ -534,9 +534,9 @@ class Server(base_server.BaseServer):
 
                 # Only append offset if not already there (binary packets)
                 last_is_offset = (
-                    isinstance(pkt.data, list) and len(pkt.data) > 0 and
-                    isinstance(pkt.data[-1], str) and
-                    len(pkt.data[-1]) == 7)
+                    isinstance(pkt.data, list) and len(pkt.data) > 0
+                    and isinstance(pkt.data[-1], str)
+                    and len(pkt.data[-1]) == 7)
                 if not last_is_offset:
                     pkt.data = list(pkt.data) + [offset]
 
@@ -574,10 +574,10 @@ class Server(base_server.BaseServer):
                 sid = recovery_info['sid']
                 # Reconnect with the same sid
                 ns_allowed = (
-                    namespace in self.handlers or
-                    namespace in self.namespace_handlers or
-                    self.namespaces == '*' or
-                    namespace in self.namespaces)
+                    namespace in self.handlers
+                    or namespace in self.namespace_handlers
+                    or self.namespaces == '*'
+                    or namespace in self.namespaces)
                 if ns_allowed:
                     # Re-establish connection with recovered sid
                     try:
@@ -604,10 +604,10 @@ class Server(base_server.BaseServer):
         # Create new connection if recovery didn't work
         if sid is None:
             ns_allowed = (
-                namespace in self.handlers or
-                namespace in self.namespace_handlers or
-                self.namespaces == '*' or
-                namespace in self.namespaces)
+                namespace in self.handlers
+                or namespace in self.namespace_handlers
+                or self.namespaces == '*'
+                or namespace in self.namespaces)
             if ns_allowed:
                 sid = self.manager.connect(eio_sid, namespace)
             if sid is None:
