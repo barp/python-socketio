@@ -22,7 +22,6 @@ class BaseManager:
         """Invoked before the first request is received. Subclasses can add
         their initialization code here.
         """
-        pass
 
     def get_namespaces(self):
         """Return an iterable with the active namespace names."""

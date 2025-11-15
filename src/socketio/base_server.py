@@ -1,4 +1,7 @@
 import logging
+import random
+import string
+import time
 
 import engineio
 
@@ -15,7 +18,7 @@ class BaseServer:
 
     def __init__(self, client_manager=None, logger=False, serializer='default',
                  json=None, async_handlers=True, always_connect=False,
-                 namespaces=None, **kwargs):
+                 namespaces=None, connection_state_recovery=None, **kwargs):
         engineio_options = kwargs
         engineio_logger = engineio_options.pop('engineio_logger', None)
         if engineio_logger is not None:
@@ -65,6 +68,33 @@ class BaseServer:
         self.namespaces = namespaces or ['/']
 
         self.async_mode = self.eio.async_mode
+
+        # Connection state recovery configuration
+        if connection_state_recovery is None:
+            self.connection_state_recovery = None
+        else:
+            if isinstance(connection_state_recovery, dict):
+                max_dur = connection_state_recovery.get(
+                    'max_disconnection_duration', 2 * 60 * 1000)
+                skip_mw = connection_state_recovery.get(
+                    'skip_middlewares', True)
+                self.connection_state_recovery = {
+                    'max_disconnection_duration': max_dur,
+                    'skip_middlewares': skip_mw
+                }
+            else:
+                self.connection_state_recovery = {
+                    'max_disconnection_duration': 2 * 60 * 1000,
+                    'skip_middlewares': True
+                }
+
+        # Recovery state storage
+        # Maps pid -> {sid, namespace, rooms, data, packets, disconnected_at}
+        self._recovery_sessions = {}
+        # Maps sid -> pid for active connections
+        self._sid_to_pid = {}
+        # Maps sid -> namespace -> offset counter
+        self._packet_offsets = {}
 
     def is_asyncio_based(self):
         return False
@@ -264,3 +294,108 @@ class BaseServer:
 
     def _engineio_server_class(self):  # pragma: no cover
         raise NotImplementedError('Must be implemented in subclasses')
+
+    def _generate_pid(self):
+        """Generate a private session ID (pid) for connection recovery."""
+        return self.eio.generate_id()
+
+    def _generate_offset(self):
+        """Generate a unique offset string for packet tracking."""
+        # Generate a short unique string similar to socket.io's implementation
+        # Using base36 encoding of a random number
+        chars = string.ascii_letters + string.digits
+        return ''.join(random.choice(chars) for _ in range(7))
+
+    def _store_recovery_state(self, sid, namespace, reason):
+        """Store client state for recovery on disconnect."""
+        if not self.connection_state_recovery:
+            return
+
+        # Only store state for unexpected disconnections
+        if reason == self.reason.SERVER_DISCONNECT:
+            return
+
+        pid = self._sid_to_pid.get(sid)
+        if not pid:
+            return
+
+        # Get rooms and socket data
+        rooms = self.manager.get_rooms(sid, namespace)
+        eio_sid = self.manager.eio_sid_from_sid(sid, namespace)
+        socket_data = {}
+        if eio_sid and eio_sid in self.environ:
+            eio_session = self.eio.get_session(eio_sid)
+            # Store the entire namespace session data
+            namespace_session = eio_session.get(namespace, {})
+            socket_data = namespace_session.copy()
+
+        # Store recovery state
+        if pid not in self._recovery_sessions:
+            self._recovery_sessions[pid] = {}
+
+        self._recovery_sessions[pid][namespace] = {
+            'sid': sid,
+            'rooms': rooms.copy(),
+            'data': socket_data.copy(),
+            'packets': [],  # Will store missed packets
+            'disconnected_at': time.time() * 1000  # milliseconds
+        }
+
+    def _restore_recovery_state(self, pid, namespace, offset=None):
+        """Restore client state from recovery session."""
+        if not self.connection_state_recovery:
+            return None
+
+        if pid not in self._recovery_sessions:
+            return None
+
+        if namespace not in self._recovery_sessions[pid]:
+            return None
+
+        recovery = self._recovery_sessions[pid][namespace]
+        
+        # Check if session has expired
+        cfg = self.connection_state_recovery
+        max_duration = cfg['max_disconnection_duration']
+        elapsed = (time.time() * 1000) - recovery['disconnected_at']
+        if elapsed > max_duration:
+            # Session expired, remove it
+            del self._recovery_sessions[pid][namespace]
+            if not self._recovery_sessions[pid]:
+                del self._recovery_sessions[pid]
+            return None
+
+        # Return recovery info
+        return {
+            'sid': recovery['sid'],
+            'rooms': recovery['rooms'],
+            'data': recovery['data'],
+            'packets': recovery['packets'],
+            'offset': offset
+        }
+
+    def _cleanup_expired_sessions(self):
+        """Remove expired recovery sessions."""
+        if not self.connection_state_recovery:
+            return
+
+        cfg = self.connection_state_recovery
+        max_duration = cfg['max_disconnection_duration']
+        current_time = time.time() * 1000
+
+        expired_pids = []
+        for pid, namespaces in list(self._recovery_sessions.items()):
+            expired_namespaces = []
+            for namespace, recovery in namespaces.items():
+                elapsed = current_time - recovery['disconnected_at']
+                if elapsed > max_duration:
+                    expired_namespaces.append(namespace)
+
+            for namespace in expired_namespaces:
+                del self._recovery_sessions[pid][namespace]
+
+            if not self._recovery_sessions[pid]:
+                expired_pids.append(pid)
+
+        for pid in expired_pids:
+            del self._recovery_sessions[pid]

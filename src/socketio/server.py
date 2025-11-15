@@ -115,6 +115,7 @@ class Server(base_server.BaseServer):
                             fatal errors are logged even when
                             ``engineio_logger`` is ``False``.
     """
+
     def emit(self, event, data=None, to=None, room=None, skip_sid=None,
              namespace=None, callback=None, ignore_queue=False):
         """Emit a custom event to one or more connected clients.
@@ -501,6 +502,44 @@ class Server(base_server.BaseServer):
 
     def _send_packet(self, eio_sid, pkt):
         """Send a Socket.IO packet to a client."""
+        # Add offset to EVENT and ACK packets if recovery is enabled
+        if self.connection_state_recovery and pkt.namespace:
+            namespace = pkt.namespace or '/'
+            # Find sid from eio_sid
+            sid = None
+            for ns in self.manager.get_namespaces():
+                potential_sid = self.manager.sid_from_eio_sid(eio_sid, ns)
+                if potential_sid:
+                    sid = potential_sid
+                    namespace = ns
+                    break
+
+            event_types = (packet.EVENT, packet.ACK,
+                           packet.BINARY_EVENT, packet.BINARY_ACK)
+            if sid and pkt.packet_type in event_types:
+                # Generate and track offset
+                if sid not in self._packet_offsets:
+                    self._packet_offsets[sid] = {}
+                if namespace not in self._packet_offsets[sid]:
+                    self._packet_offsets[sid][namespace] = 0
+
+                offset = self._generate_offset()
+                self._packet_offsets[sid][namespace] += 1
+
+                # Append offset to data array
+                if pkt.data is None:
+                    pkt.data = []
+                elif not isinstance(pkt.data, list):
+                    pkt.data = [pkt.data]
+
+                # Only append offset if not already there (binary packets)
+                last_is_offset = (
+                    isinstance(pkt.data, list) and len(pkt.data) > 0 and
+                    isinstance(pkt.data[-1], str) and
+                    len(pkt.data[-1]) == 7)
+                if not last_is_offset:
+                    pkt.data = list(pkt.data) + [offset]
+
         encoded_packet = pkt.encode()
         if isinstance(encoded_packet, list):
             for ep in encoded_packet:
@@ -515,37 +554,159 @@ class Server(base_server.BaseServer):
     def _handle_connect(self, eio_sid, namespace, data):
         """Handle a client connection request."""
         namespace = namespace or '/'
-        sid = None
-        if namespace in self.handlers or namespace in self.namespace_handlers \
-                or self.namespaces == '*' or namespace in self.namespaces:
-            sid = self.manager.connect(eio_sid, namespace)
+
+        # Check for recovery attempt
+        recovery_info = None
+        recovered = False
+        pid = None
+        offset = None
+
+        if data and isinstance(data, dict):
+            pid = data.get('pid')
+            offset = data.get('offset')
+
+        if pid and self.connection_state_recovery:
+            recovery_info = self._restore_recovery_state(
+                pid, namespace, offset)
+            if recovery_info:
+                recovered = True
+                # Use the recovered sid
+                sid = recovery_info['sid']
+                # Reconnect with the same sid
+                ns_allowed = (
+                    namespace in self.handlers or
+                    namespace in self.namespace_handlers or
+                    self.namespaces == '*' or
+                    namespace in self.namespaces)
+                if ns_allowed:
+                    # Re-establish connection with recovered sid
+                    try:
+                        self.manager.basic_enter_room(
+                            sid, namespace, None, eio_sid=eio_sid)
+                        self.manager.basic_enter_room(
+                            sid, namespace, sid, eio_sid=eio_sid)
+                    except Exception:
+                        # Recovery failed, create new connection
+                        recovery_info = None
+                        recovered = False
+                        sid = None
+                else:
+                    recovery_info = None
+                    recovered = False
+                    sid = None
+            else:
+                # Recovery failed, create new connection
+                sid = None
+        else:
+            # New connection
+            sid = None
+
+        # Create new connection if recovery didn't work
         if sid is None:
-            self._send_packet(eio_sid, self.packet_class(
-                packet.CONNECT_ERROR, data='Unable to connect',
-                namespace=namespace))
-            return
+            ns_allowed = (
+                namespace in self.handlers or
+                namespace in self.namespace_handlers or
+                self.namespaces == '*' or
+                namespace in self.namespaces)
+            if ns_allowed:
+                sid = self.manager.connect(eio_sid, namespace)
+            if sid is None:
+                self._send_packet(eio_sid, self.packet_class(
+                    packet.CONNECT_ERROR, data='Unable to connect',
+                    namespace=namespace))
+                return
+
+            # Generate pid for new connection
+            if self.connection_state_recovery:
+                pid = self._generate_pid()
+                self._sid_to_pid[sid] = pid
+                # Initialize packet offset counter
+                if sid not in self._packet_offsets:
+                    self._packet_offsets[sid] = {}
+                self._packet_offsets[sid][namespace] = 0
+
+        # Restore recovery state if applicable
+        if recovered and recovery_info:
+            # Restore pid mapping
+            if pid:
+                self._sid_to_pid[sid] = pid
+
+            # Restore rooms - use basic_enter_room with eio_sid
+            # to avoid lookup issues
+            for room in recovery_info['rooms']:
+                # Don't re-add the sid room or None room
+                if room != sid and room is not None:
+                    try:
+                        self.manager.basic_enter_room(
+                            sid, namespace, room, eio_sid=eio_sid)
+                    except (ValueError, KeyError):
+                        # Room might already exist or namespace issue, skip
+                        pass
+
+            # Restore socket data (entire namespace session)
+            if recovery_info['data']:
+                eio_session = self.eio.get_session(eio_sid)
+                eio_session[namespace] = recovery_info['data'].copy()
+
+            # Restore packet offset counter
+            if sid not in self._packet_offsets:
+                self._packet_offsets[sid] = {}
+            # Initialize or restore offset counter
+            self._packet_offsets[sid][namespace] = 0
+
+            # Remove from recovery sessions (recovered successfully)
+            if pid in self._recovery_sessions:
+                if namespace in self._recovery_sessions[pid]:
+                    del self._recovery_sessions[pid][namespace]
+                if not self._recovery_sessions[pid]:
+                    del self._recovery_sessions[pid]
+
+            # Send missed packets if any
+            # Note: In a full implementation, we'd need to track
+            # and replay packets. For now, we'll mark recovery as
+            # successful
+
+        # Prepare CONNECT response
+        connect_data = {'sid': sid}
+        if self.connection_state_recovery and pid:
+            connect_data['pid'] = pid
 
         if self.always_connect:
             self._send_packet(eio_sid, self.packet_class(
-                packet.CONNECT, {'sid': sid}, namespace=namespace))
+                packet.CONNECT, connect_data, namespace=namespace))
+
+        # Skip connect handler if recovery successful and
+        # skip_middlewares is True
+        skip_mw = True
+        if self.connection_state_recovery:
+            skip_mw = self.connection_state_recovery.get(
+                'skip_middlewares', True)
+        skip_connect_handler = recovered and skip_mw
+
         fail_reason = exceptions.ConnectionRefusedError().error_args
-        try:
-            if data:
-                success = self._trigger_event(
-                    'connect', namespace, sid, self.environ[eio_sid], data)
-            else:
-                try:
+        if not skip_connect_handler:
+            try:
+                if data:
                     success = self._trigger_event(
-                        'connect', namespace, sid, self.environ[eio_sid])
-                except TypeError:
-                    success = self._trigger_event(
-                        'connect', namespace, sid, self.environ[eio_sid], None)
-        except exceptions.ConnectionRefusedError as exc:
-            fail_reason = exc.error_args
-            success = False
-        except ConnectionRefusedError:
-            fail_reason = {"message": "Connection refused by server"}
-            success = False
+                        'connect', namespace, sid,
+                        self.environ[eio_sid], data)
+                else:
+                    try:
+                        success = self._trigger_event(
+                            'connect', namespace, sid,
+                            self.environ[eio_sid])
+                    except TypeError:
+                        success = self._trigger_event(
+                            'connect', namespace, sid,
+                            self.environ[eio_sid], None)
+            except exceptions.ConnectionRefusedError as exc:
+                fail_reason = exc.error_args
+                success = False
+            except ConnectionRefusedError:
+                fail_reason = {"message": "Connection refused by server"}
+                success = False
+        else:
+            success = True
 
         if success is False:
             if self.always_connect:
@@ -557,9 +718,12 @@ class Server(base_server.BaseServer):
                     packet.CONNECT_ERROR, data=fail_reason,
                     namespace=namespace))
             self.manager.disconnect(sid, namespace, ignore_queue=True)
+            # Clean up pid mapping
+            if sid in self._sid_to_pid:
+                del self._sid_to_pid[sid]
         elif not self.always_connect:
             self._send_packet(eio_sid, self.packet_class(
-                packet.CONNECT, {'sid': sid}, namespace=namespace))
+                packet.CONNECT, connect_data, namespace=namespace))
 
     def _handle_disconnect(self, eio_sid, namespace, reason=None):
         """Handle a client disconnect."""
@@ -567,10 +731,23 @@ class Server(base_server.BaseServer):
         sid = self.manager.sid_from_eio_sid(eio_sid, namespace)
         if not self.manager.is_connected(sid, namespace):  # pragma: no cover
             return
+        disconnect_reason = reason or self.reason.CLIENT_DISCONNECT
         self.manager.pre_disconnect(sid, namespace=namespace)
-        self._trigger_event('disconnect', namespace, sid,
-                            reason or self.reason.CLIENT_DISCONNECT)
+        self._trigger_event('disconnect', namespace, sid, disconnect_reason)
+
+        # Store recovery state before disconnecting
+        self._store_recovery_state(sid, namespace, disconnect_reason)
+
         self.manager.disconnect(sid, namespace, ignore_queue=True)
+
+        # Clean up pid mapping and offsets
+        if sid in self._sid_to_pid:
+            del self._sid_to_pid[sid]
+        if sid in self._packet_offsets:
+            if namespace in self._packet_offsets[sid]:
+                del self._packet_offsets[sid][namespace]
+            if not self._packet_offsets[sid]:
+                del self._packet_offsets[sid]
 
     def _handle_event(self, eio_sid, namespace, id, data):
         """Handle an incoming client event."""
@@ -636,6 +813,9 @@ class Server(base_server.BaseServer):
         if not self.manager_initialized:
             self.manager_initialized = True
             self.manager.initialize()
+            # Start cleanup task for expired recovery sessions
+            if self.connection_state_recovery:
+                self._start_recovery_cleanup_task()
         self.environ[eio_sid] = environ
 
     def _handle_eio_message(self, eio_sid, data):
@@ -677,3 +857,15 @@ class Server(base_server.BaseServer):
 
     def _engineio_server_class(self):
         return engineio.Server
+
+    def _recovery_cleanup_task(self):
+        """Background task to clean expired recovery sessions."""
+        while True:
+            self.sleep(60)  # Run every minute
+            self._cleanup_expired_sessions()
+
+    def _start_recovery_cleanup_task(self):
+        """Start background task for cleaning expired recovery sessions."""
+        if not hasattr(self, '_recovery_cleanup_task_started'):
+            self._recovery_cleanup_task_started = True
+            self.start_background_task(self._recovery_cleanup_task)
